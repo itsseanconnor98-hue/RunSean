@@ -552,6 +552,30 @@ self.addEventListener('fetch',e=>e.respondWith(
       <button class="btn-p" style="font-size:0.88rem;padding:11px;" onclick="saveFeedback()">Save Feedback</button>
       <div id="fb-history" style="margin-top:14px;"></div>
     </div>
+    <div class="sec-lbl">ATHLETE PROFILE</div>
+    <div style="background:var(--white);border-radius:16px;border:1px solid var(--border);margin:0 16px 8px;padding:14px 16px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+        <div>
+          <div style="font-size:0.72rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:5px;">Height</div>
+          <div style="display:flex;gap:6px;">
+            <input id="prof-ft" type="number" min="3" max="8" placeholder="ft" style="width:50%;background:var(--s1);border:1.5px solid var(--border);border-radius:8px;padding:7px 9px;font-family:var(--font);font-size:0.88rem;color:var(--text);outline:none;">
+            <input id="prof-in" type="number" min="0" max="11" placeholder="in" style="width:50%;background:var(--s1);border:1.5px solid var(--border);border-radius:8px;padding:7px 9px;font-family:var(--font);font-size:0.88rem;color:var(--text);outline:none;">
+          </div>
+        </div>
+        <div>
+          <div style="font-size:0.72rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:5px;">Weight (lbs)</div>
+          <input id="prof-lbs" type="number" min="80" max="400" placeholder="e.g. 145" style="width:100%;background:var(--s1);border:1.5px solid var(--border);border-radius:8px;padding:7px 9px;font-family:var(--font);font-size:0.88rem;color:var(--text);outline:none;box-sizing:border-box;">
+        </div>
+      </div>
+      <button onclick="saveAthleteProfile()" style="width:100%;padding:9px;background:var(--s1);border:1.5px solid var(--border);border-radius:10px;font-family:var(--font);font-size:0.82rem;font-weight:700;cursor:pointer;color:var(--text);margin-bottom:10px;">Save Profile</button>
+      <div style="border-top:1px solid var(--border);padding-top:10px;">
+        <div style="font-size:0.78rem;font-weight:700;color:var(--text);margin-bottom:4px;">🔄 Recalibrate Plan</div>
+        <div style="font-size:0.72rem;color:var(--muted);margin-bottom:9px;line-height:1.5;">Updates your pace zones and adjusts all upcoming workouts based on your logged run history and body metrics. Use this when the suggested paces feel too hard or too easy.</div>
+        <div id="recal-status" style="font-size:0.72rem;color:var(--muted);margin-bottom:8px;min-height:16px;"></div>
+        <button onclick="recalibratePlan()" style="width:100%;padding:10px;background:var(--acc);color:white;border:none;border-radius:10px;font-family:var(--font);font-size:0.85rem;font-weight:700;cursor:pointer;">Recalibrate Now</button>
+      </div>
+    </div>
+
     <div class="sec-lbl">TRAINING PREFERENCES</div>
     <div id="prefs-body"></div>
     <div class="sec-lbl" style="display:flex;justify-content:space-between;align-items:center;">
@@ -1507,6 +1531,90 @@ function saveBonusLog(){
   renderTraining();renderProfile();
 }
 
+// ── Athlete Profile + Recalibrate ───────────────────────────────────────────
+function saveAthleteProfile(){
+  const ft=parseInt($('prof-ft').value)||0;
+  const inch=parseInt($('prof-in').value)||0;
+  const lbs=parseFloat($('prof-lbs').value)||0;
+  if(ft>0)U.heightFt=ft;
+  if(inch>=0&&ft>0)U.heightIn=inch;
+  if(lbs>0)U.weightLbs=lbs;
+  saveDB();
+  showToast('Profile saved ✓');
+}
+
+function getCalibrationPace(){
+  // Priority 1: derive from recent logged workouts (most accurate)
+  const allLogged=getAllWk().filter(w=>w.completed&&w.log?.pace&&w.log?.miles>0&&w.type!=='race');
+  if(allLogged.length>=3){
+    // Use median pace from last 10 workouts to avoid outliers
+    const recent=allLogged.slice(-10);
+    const paces=recent.map(w=>{
+      const p=w.log.pace.split(':');
+      return parseInt(p[0])*60+(parseInt(p[1])||0); // seconds per mile
+    }).sort((a,b)=>a-b);
+    const median=paces[Math.floor(paces.length/2)];
+    // This is an easy-run pace, convert to a synthetic 5K baseline
+    // Easy pace is roughly 1.30x 5K pace, so 5K pace ≈ easy/1.30
+    const synth5kSec=median/1.30;
+    const synth5kMin=synth5kSec/60;
+    // Return as {m5k, s5k}
+    return{m5k:Math.floor(synth5kMin),s5k:Math.round((synth5kMin%1)*60),source:'logged'};
+  }
+  // Priority 2: use stored fitness data
+  if(U.fitness?.m5k){
+    return{m5k:U.fitness.m5k,s5k:U.fitness.s5k||0,source:'stored'};
+  }
+  // Priority 3: estimate from height/weight if available
+  if(U.weightLbs&&U.heightFt){
+    const heightIn=(U.heightFt*12)+(U.heightIn||0);
+    const heightCm=heightIn*2.54;
+    const weightKg=U.weightLbs*0.453592;
+    // VO2max estimate (Uth-Sorensen formula approximation from height/weight)
+    // Rough 5K time estimate for recreational runner by BMI
+    const bmi=weightKg/((heightCm/100)**2);
+    // Conservative estimate: ~1 min per mile penalty above BMI 22 baseline
+    const bmiPenalty=Math.max(0,(bmi-22)*0.4);
+    const base5kMin=28+bmiPenalty; // very conservative default
+    return{m5k:Math.floor(base5kMin),s5k:Math.round((base5kMin%1)*60),source:'estimated'};
+  }
+  // Priority 4: conservative default (30-min 5K = 9:39/mi pace)
+  return{m5k:30,s5k:0,source:'default'};
+}
+
+function recalibratePlan(){
+  const cal=getCalibrationPace();
+  // Update fitness with calibrated values
+  U.fitness.m5k=cal.m5k;
+  U.fitness.s5k=cal.s5k;
+
+  // Now rebuild descriptions in all upcoming (uncompleted) workouts
+  const today=new Date();today.setHours(0,0,0,0);
+  const zones=getUserZones();
+  let updated=0;
+  (U.unifiedPlan||[]).forEach(wk=>{
+    wk.workouts.forEach(w=>{
+      if(w.completed)return;
+      const wd=new Date(w.date);wd.setHours(0,0,0,0);
+      if(wd<today)return;
+      const z=zones.find(z=>z.id===w.type);
+      if(z){
+        // Rebuild desc with new pace
+        w.desc=getWkoutDesc(w.type,wk.number-1,findRace(w.raceId)?.level||'intermediate',w.km);
+        updated++;
+      }
+    });
+  });
+
+  saveDB();
+  const sourceMsg={logged:'your logged runs',stored:'your saved 5K time',estimated:'your body metrics',default:'a conservative default'}[cal.source];
+  const statusEl=$('recal-status');
+  if(statusEl)statusEl.textContent=`Calibrated from ${sourceMsg}. Base 5K: ${cal.m5k}:${String(cal.s5k).padStart(2,'0')}`;
+  showToast(`Plan recalibrated ✓ (${updated} workouts updated)`);
+  renderTraining();
+}
+// ── End Recalibrate ──────────────────────────────────────────────────────────
+
 async function doLogout(){if(window._supa)await window._supa.auth.signOut();CU=null;U=null;$('auth-screen').style.display='flex';$('app').style.display='none';$('nav').style.display='none'}
 
 // ═══════════════════════════════════════════════════════════════
@@ -1549,7 +1657,7 @@ function getZone(type){return getUserZones().find(z=>z.id===type)||null}
 // STRUCTURED WORKOUT STEPS
 // ═══════════════════════════════════════════════════════════════
 function buildSteps(type,km,baseMph){
-  const mi=(km/1.60934);const mph=Math.max(3.5,parseFloat(baseMph)||5.5);
+  const mi=(km/1.60934);const mph=Math.max(3.0,parseFloat(baseMph)||4.5);
   const fsp=s=>s.toFixed(1)+' mph';
   const fp=s=>fmm(3600/(s*1.60934))+'/mi';
   // helpers for explicit distances
@@ -2320,7 +2428,19 @@ function openLog(id){
   $('log-title').textContent=wdef.label;
   $('log-sub').textContent=`${dt.toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'})} · ${w.miles.toFixed(1)} mi / ${w.km} km · ${race?.name||race?.distance||''}`;
   // Steps
-  const z=getZone(w.type);const steps=buildSteps(w.type,w.km,z?.mph||5.5);
+  const z=getZone(w.type);
+  // Use calibrated pace if no zone found (no 5K time entered)
+  let baseMphForSteps=z?.mph;
+  if(!baseMphForSteps){
+    const cal=getCalibrationPace();
+    const base=b5kSpk(cal.m5k,cal.s5k);
+    if(base){
+      const easyZone=ZONES.find(z=>z.id==='easy');
+      const spk=base*(easyZone?.mult||1.30);
+      baseMphForSteps=parseFloat(spkMph(spk));
+    }
+  }
+  const steps=buildSteps(w.type,w.km,baseMphForSteps||4.5);
   $('log-steps-wrap').innerHTML=steps.length?`<div class="session-card"><div class="session-title">${w.type==='race'?'Race Day':'Workout Structure'}</div>${steps.map((s,i)=>`<div class="step"><div class="step-n">${i+1}</div><div class="step-body"><div class="step-desc">${s.desc}</div><div class="step-speed">${s.speed} · ${s.dist}</div></div></div>`).join('')}</div>`:'';
   // Pre-fill
   $('log-mi').value=w.log?.miles||'';$('log-km').value=w.log?.km||'';
@@ -2775,6 +2895,11 @@ function setBackburner(id){
 function renderProfile(){
   if(!U)return;
   setTimeout(refreshCloudBadge,100);
+  // Populate athlete profile fields
+  const ftEl=$('prof-ft'),inEl=$('prof-in'),lbsEl=$('prof-lbs');
+  if(ftEl&&U.heightFt)ftEl.value=U.heightFt;
+  if(inEl&&U.heightIn!==undefined)inEl.value=U.heightIn;
+  if(lbsEl&&U.weightLbs)lbsEl.value=U.weightLbs;
   $('prof-av').textContent=U.name.charAt(0).toUpperCase();$('prof-name').textContent=U.name;
   $('prof-since').textContent='Member since '+new Date(U.createdAt).toLocaleDateString('en-US',{month:'long',year:'numeric'});
 
